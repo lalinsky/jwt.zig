@@ -208,7 +208,7 @@ pub fn encode(allocator: Allocator, claims: anytype, key: Key) EncodingError![]u
 
     const aa = arena.allocator();
 
-    const claims_json = try std.json.stringifyAlloc(aa, claims, .{});
+    const claims_json = try std.json.Stringify.valueAlloc(aa, claims, .{});
     const claims_base64 = try util.base64URLEncode(aa, claims_json);
 
     const header = .{
@@ -216,7 +216,7 @@ pub fn encode(allocator: Allocator, claims: anytype, key: Key) EncodingError![]u
         .typ = "JWT",
     };
 
-    const header_json = try std.json.stringifyAlloc(aa, header, .{});
+    const header_json = try std.json.Stringify.valueAlloc(aa, header, .{});
     const header_base64 = try util.base64URLEncode(aa, header_json);
 
     const message = try std.fmt.allocPrint(aa, "{s}.{s}", .{
@@ -265,8 +265,8 @@ pub fn DecodeOpts(comptime T: type) type {
 ///
 /// The caller *must* call `deinit()` on the returned item to release the allocated
 /// memory.
-pub fn decode(comptime T: type, allocator: Allocator, token: []const u8, key: Key) DecodingError!TokenData(T) {
-    return decodeOpts(T, allocator, token, key, .{});
+pub fn decode(comptime T: type, allocator: Allocator, io: std.Io, token: []const u8, key: Key) DecodingError!TokenData(T) {
+    return decodeOpts(T, allocator, io, token, key, .{});
 }
 
 /// Same as `decode()` but with the ability to provide specific options
@@ -277,6 +277,7 @@ pub fn decode(comptime T: type, allocator: Allocator, token: []const u8, key: Ke
 pub fn decodeOpts(
     comptime T: type,
     allocator: Allocator,
+    io: std.Io,
     token: []const u8,
     key: Key,
     opts: DecodeOpts(T),
@@ -307,7 +308,7 @@ pub fn decodeOpts(
     var data = try TokenData(T).init(allocator, claims);
     errdefer data.deinit();
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
 
     if (claim_info.has_exp and (now - opts.leeway_seconds) > data.claims.exp) {
         return error.TokenExpired;
@@ -328,6 +329,7 @@ const jwt = @This();
 
 test encode {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         iat: i64,
@@ -336,7 +338,7 @@ test encode {
         name: []const u8,
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     // We want this token to expire in 15 minutes.
     const exp = now + (15 * std.time.s_per_min);
 
@@ -380,8 +382,9 @@ test "encode: token contains base64url encoded header with alg" {
 
 test "encode: token contains base64url encoded claims" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    const iat = std.time.timestamp();
+    const iat = std.Io.Clock.real.now(io).toSeconds();
     const exp: i64 = iat + (15 * std.time.s_per_min);
 
     const Claims = struct {
@@ -446,6 +449,7 @@ test "encode: token contains empty signature for none alg" {
 
 test decode {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         iat: i64,
@@ -454,7 +458,7 @@ test decode {
         name: []const u8,
     };
 
-    const iat = std.time.timestamp();
+    const iat = std.Io.Clock.real.now(io).toSeconds();
     const exp: i64 = iat + (15 * std.time.s_per_min);
 
     const claims = .{
@@ -469,7 +473,7 @@ test decode {
     defer allocator.free(token);
 
     // A token must be decoded with the same secret and algorithm it was decoded with.
-    var data = try jwt.decode(Claims, allocator, token, .{
+    var data = try jwt.decode(Claims, allocator, io, token, .{
         .hs256 = secret,
     });
     defer data.deinit();
@@ -482,6 +486,7 @@ test decode {
 
 test "decode: returns with non-standard claims" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         name: []const u8,
@@ -495,7 +500,7 @@ test "decode: returns with non-standard claims" {
     });
     defer allocator.free(token);
 
-    var data = try decode(Claims, allocator, token, .{
+    var data = try decode(Claims, allocator, io, token, .{
         .hs256 = secret,
     });
     defer data.deinit();
@@ -505,6 +510,7 @@ test "decode: returns with non-standard claims" {
 
 test "decode: returns error if signature is invalid" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         sub: []const u8,
@@ -517,20 +523,21 @@ test "decode: returns error if signature is invalid" {
     });
     defer allocator.free(token);
 
-    try std.testing.expectError(error.TokenSignatureInvalid, decode(Claims, allocator, token, .{
+    try std.testing.expectError(error.TokenSignatureInvalid, decode(Claims, allocator, io, token, .{
         .hs256 = "hackers-256-bit-token",
     }));
 }
 
 test "decode: returns error if token is expired" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         iat: i64,
         exp: i64,
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     const exp = now - (std.time.s_per_min * 15);
     const iat = exp - (std.time.s_per_min * 30);
 
@@ -545,19 +552,20 @@ test "decode: returns error if token is expired" {
     });
     defer allocator.free(token);
 
-    try std.testing.expectError(error.TokenExpired, decode(Claims, allocator, token, .{
+    try std.testing.expectError(error.TokenExpired, decode(Claims, allocator, io, token, .{
         .hs256 = secret,
     }));
 }
 
 test "decode: returns error if before nbf" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         nbf: i64,
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     const nbf = now + (std.time.s_per_min * 15);
 
     const claims = .{
@@ -570,13 +578,14 @@ test "decode: returns error if before nbf" {
     });
     defer allocator.free(token);
 
-    try std.testing.expectError(error.TokenTooEarly, decode(Claims, allocator, token, .{
+    try std.testing.expectError(error.TokenTooEarly, decode(Claims, allocator, io, token, .{
         .hs256 = secret,
     }));
 }
 
 test decodeOpts {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         nbf: i64,
@@ -592,7 +601,7 @@ test decodeOpts {
         }
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     // This is in the past;
     const exp = now - 10;
     // and this is in the future...
@@ -613,6 +622,7 @@ test decodeOpts {
     var data = try jwt.decodeOpts(
         Claims,
         allocator,
+        io,
         token,
         .{ .hs256 = secret },
         .{
@@ -634,6 +644,7 @@ test decodeOpts {
 
 test "decodeOpts: returns error if custom validator failed" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         list: []const []const u8,
@@ -660,6 +671,7 @@ test "decodeOpts: returns error if custom validator failed" {
     try std.testing.expectError(error.TokenCustomValidatorFailed, decodeOpts(
         Claims,
         allocator,
+        io,
         token,
         .{ .hs256 = secret },
         .{ .validator = Validator.validate },
@@ -668,12 +680,13 @@ test "decodeOpts: returns error if custom validator failed" {
 
 test "decodeOpts: returns token if exp within leeway" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         exp: i64,
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     const exp = now - 15;
 
     const claims: Claims = .{
@@ -689,6 +702,7 @@ test "decodeOpts: returns token if exp within leeway" {
     var data = try decodeOpts(
         Claims,
         allocator,
+        io,
         token,
         .{ .hs256 = secret },
         .{ .leeway_seconds = 120 },
@@ -700,12 +714,13 @@ test "decodeOpts: returns token if exp within leeway" {
 
 test "decodeOpts: returns token if nbf within leeway" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const Claims = struct {
         nbf: i64,
     };
 
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     const nbf = now + 15;
 
     const claims: Claims = .{
@@ -721,6 +736,7 @@ test "decodeOpts: returns token if nbf within leeway" {
     var data = try decodeOpts(
         Claims,
         allocator,
+        io,
         token,
         .{ .hs256 = secret },
         .{ .leeway_seconds = 120 },
